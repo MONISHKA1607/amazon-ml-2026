@@ -56,7 +56,7 @@ def load_selected_records(
         sep="\t",
         dtype=str,
         usecols=usecols,
-        chunksize=100_000,
+        chunksize=5_000,
     ):
         # -----------------------------------------------------------
         # Keep every required true-match record.

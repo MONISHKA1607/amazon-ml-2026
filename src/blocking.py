@@ -28,6 +28,8 @@ from typing import Callable
 
 import pandas as pd
 
+import re
+
 from .blocking_config import BlockingConfig
 
 
@@ -78,25 +80,31 @@ def _numeric_tokens_for_block(
     Normalize the representation of numeric_tokens.
 
     The normalize module may store numeric tokens as a list/tuple/set
-    or as a whitespace-separated string.
+    or as a comma/whitespace-separated string.
     """
-
     if value is None:
         return []
 
     if isinstance(value, (list, tuple, set)):
-        return [
-            str(token)
-            for token in value
-            if str(token)
-        ]
+        tokens = []
+        for token in value:
+            token = str(token).strip()
+            if not token:
+                continue
+
+            parts = re.split(r"[,\s]+", token)
+
+            for part in parts:
+                if part:
+                    tokens.append(part)
+
+        return tokens
 
     return [
         token
-        for token in str(value).split()
+        for token in re.split(r"[,\s]+", str(value).strip())
         if token
     ]
-
 
 def _country_name_prefix_for_block(
     country: str | None,
@@ -129,6 +137,69 @@ def _country_name_prefix_for_block(
         f"{country}||{prefix}"
     ]
 
+def _address_numeric_anchor_keys(
+    address: str | None,
+    numeric_tokens,
+    min_token_length: int = 4,
+) -> list[str]:
+    """
+    Create address anchors combining a numeric token with a meaningful
+    address token.
+
+    Examples:
+
+        "sco 404 ... karnal haryana"
+        -> ["404||karnal", "404||haryana"]
+
+    These anchors are useful when business names are unreliable but an
+    address contains a stable house/shop number plus locality.
+    """
+
+    address_tokens = _safe_tokens(
+        address,
+        min_token_length,
+    )
+
+    numbers = _numeric_tokens_for_block(
+        numeric_tokens
+    )
+
+    if not address_tokens or not numbers:
+        return []
+
+    return [
+        f"{number}||{token}"
+        for number in set(numbers)
+        for token in set(address_tokens)
+    ]
+
+
+def _translit_country_name_prefix_for_block(
+    country: str | None,
+    name: str | None,
+    prefix_len: int = 4,
+) -> list[str]:
+    """
+    Country-scoped prefix block using the transliterated name.
+    """
+
+    if not country or not name:
+        return []
+
+    country = str(country).strip().lower()
+    name = str(name).strip()
+
+    if not country or not name:
+        return []
+
+    prefix = name[:prefix_len]
+
+    if len(prefix) < prefix_len:
+        return []
+
+    return [
+        f"{country}||{prefix}"
+    ]
 
 # ---------------------------------------------------------------------------
 # Inverted-index construction
@@ -260,21 +331,59 @@ def _build_rare_token_index(
 
 def _rank_candidates(
     candidate_scores: dict[str, int],
+    candidate_blocks: dict[str, set[str]],
     max_candidates: int,
 ) -> list[str]:
     """
-    Rank candidates by blocking evidence.
+    Rank candidates using weighted blocking evidence.
 
-    More blocking agreements means a candidate is supported by more
-    independent blocking signals.
-
-    Candidate ID is used as a deterministic tie-breaker.
+    Strong structural/exact signals receive more weight than broad
+    fuzzy/token signals. Candidate ID is used as a deterministic
+    tie-breaker.
     """
 
+    block_weights = {
+        # Very strong structural/exact evidence
+        "exact_name": 8,
+        "address_numeric_anchor": 8,
+
+        # Strong rare evidence
+        "rare_name_token": 4,
+        "rare_address_token": 4,
+        "rare_translit_address_token": 4,
+
+        # Structured token evidence
+        "numeric_tokens": 3,
+        "country_name_prefix": 3,
+
+        # Ordinary token evidence
+        "name_tokens": 2,
+        "address_tokens": 2,
+        "translit_name_tokens": 2,
+        "translit_address_tokens": 2,
+
+        # Broad fuzzy evidence
+        "char_ngrams": 1,
+        "translit_char_ngrams": 1,
+    }
+
+    weighted_scores = {}
+
+    for candidate_id, raw_score in candidate_scores.items():
+        blocks = candidate_blocks.get(candidate_id, set())
+
+        weighted_score = sum(
+            block_weights.get(block, 1)
+            for block in blocks
+        )
+
+        weighted_scores[candidate_id] = weighted_score
+
     ranked = sorted(
-        candidate_scores.items(),
+        weighted_scores.items(),
         key=lambda item: (
             -item[1],
+            -candidate_scores[item[0]],
             item[0],
         ),
     )
@@ -283,7 +392,6 @@ def _rank_candidates(
         candidate_id
         for candidate_id, _ in ranked[:max_candidates]
     ]
-
 
 # ---------------------------------------------------------------------------
 # Main candidate generation
@@ -344,6 +452,11 @@ def generate_candidates(
             "char_ngrams",
             "numeric_tokens",
             "country_name_prefix",
+            "translit_exact_name",
+            "translit_name_tokens",
+            "translit_char_ngrams",
+            "translit_address_tokens",
+            "address_numeric_anchor",
         ]
 
     # ------------------------------------------------------------------
@@ -440,6 +553,68 @@ def generate_candidates(
             config.max_candidates_per_block,
         )
 
+        if "translit_exact_name" in block_names:
+
+            indices["translit_exact_name"] = _build_inverted_index(
+                other_df,
+                lambda row: (
+                    [row.translit_name]
+                    if getattr(row, "translit_name", "")
+                    else []
+                ),
+                config.max_block_frequency,
+                config.max_candidates_per_block,
+            )
+
+        if "translit_name_tokens" in block_names:
+
+            indices["translit_name_tokens"] = _build_inverted_index(
+                other_df,
+                lambda row: _safe_tokens(
+                    getattr(row, "translit_name", ""),
+                    config.min_token_length,
+                ),
+                config.max_block_frequency,
+                config.max_candidates_per_block,
+            )
+
+        if "translit_char_ngrams" in block_names:
+
+            indices["translit_char_ngrams"] = _build_inverted_index(
+                other_df,
+                lambda row: _char_ngrams_for_block(
+                    getattr(row, "translit_name", ""),
+                    config.char_ngram_size,
+                ),
+                config.max_block_frequency,
+                config.max_candidates_per_block,
+            )
+
+        if "translit_address_tokens" in block_names:
+
+            indices["translit_address_tokens"] = _build_inverted_index(
+                other_df,
+                lambda row: _safe_tokens(
+                    getattr(row, "translit_address", ""),
+                    config.min_token_length,
+                ),
+                config.max_block_frequency,
+                config.max_candidates_per_block,
+            )
+
+        if "address_numeric_anchor" in block_names:
+
+            indices["address_numeric_anchor"] = _build_inverted_index(
+                other_df,
+                lambda row: _address_numeric_anchor_keys(
+                    getattr(row, "norm_address", ""),
+                    getattr(row, "numeric_tokens", ""),
+                    config.address_anchor_min_token_length,
+                ),
+                config.max_block_frequency,
+                config.max_candidates_per_block,
+            )
+
     # ------------------------------------------------------------------
     # Rare-token indices
     # ------------------------------------------------------------------
@@ -467,6 +642,28 @@ def generate_candidates(
             config.rare_token_frequency,
             config.min_token_length,
         )
+
+        translit_address_frequency = Counter()
+
+        if "translit_address_tokens" in block_names:
+
+            translit_address_frequency = _build_token_frequency(
+                other_df,
+                "translit_address",
+                config.min_token_length,
+            )
+
+        rare_translit_address_index: dict[str, list[str]] = {}
+
+        if "translit_address_tokens" in block_names:
+
+            rare_translit_address_index = _build_rare_token_index(
+                other_df,
+                "translit_address",
+                translit_address_frequency,
+                config.rare_token_frequency,
+                config.min_token_length,
+            )
 
     # ------------------------------------------------------------------
     # Generate candidates
@@ -565,6 +762,65 @@ def generate_candidates(
                     ),
                 )
 
+            elif block_name == "translit_exact_name":
+
+                keys = [
+                    getattr(
+                        s1_row,
+                        "translit_name",
+                        "",
+                    )
+                ]
+
+            elif block_name == "translit_name_tokens":
+
+                keys = _safe_tokens(
+                    getattr(
+                        s1_row,
+                        "translit_name",
+                        "",
+                    ),
+                    config.min_token_length,
+                )
+
+            elif block_name == "translit_char_ngrams":
+
+                keys = _char_ngrams_for_block(
+                    getattr(
+                        s1_row,
+                        "translit_name",
+                        "",
+                    ),
+                    config.char_ngram_size,
+                )
+
+            elif block_name == "translit_address_tokens":
+
+                keys = _safe_tokens(
+                    getattr(
+                        s1_row,
+                        "translit_address",
+                        "",
+                    ),
+                    config.min_token_length,
+                )
+
+            elif block_name == "address_numeric_anchor":
+
+                keys = _address_numeric_anchor_keys(
+                    getattr(
+                        s1_row,
+                        "norm_address",
+                        "",
+                    ),
+                    getattr(
+                        s1_row,
+                        "numeric_tokens",
+                        "",
+                    ),
+                    config.address_anchor_min_token_length,
+                )
+
             else:
                 continue
 
@@ -659,11 +915,46 @@ def generate_candidates(
                     )
 
         # --------------------------------------------------------------
+        # Rare transliterated-address-token evidence
+        # --------------------------------------------------------------
+
+        if "translit_address_tokens" in block_names:
+
+            translit_address_tokens = _safe_tokens(
+                getattr(
+                    s1_row,
+                    "translit_address",
+                    "",
+                ),
+                config.min_token_length,
+            )
+
+            for token in translit_address_tokens:
+
+                candidate_ids = rare_translit_address_index.get(
+                    token,
+                    [],
+                )
+
+                for candidate_id in candidate_ids:
+
+                    candidate_scores[
+                        candidate_id
+                    ] += 1
+
+                    candidate_blocks[
+                        candidate_id
+                    ].add(
+                        "rare_translit_address_token"
+                    )
+
+        # --------------------------------------------------------------
         # Candidate ranking and cap
         # --------------------------------------------------------------
 
         selected_ids = _rank_candidates(
             candidate_scores,
+            candidate_blocks,
             config.max_candidates_per_entity,
         )
 
@@ -671,27 +962,27 @@ def generate_candidates(
             s1_id
         ] = len(selected_ids)
 
-        # --------------------------------------------------------------
+                # --------------------------------------------------------------
         # Save candidate rows
         # --------------------------------------------------------------
 
         for candidate_id in selected_ids:
 
             rows.append(
-                {
-                    "source1_entity_id": s1_id,
-                    "candidate_entity_id": candidate_id,
-                    "blocks_matched": "|".join(
+                (
+                    s1_id,
+                    candidate_id,
+                    "|".join(
                         sorted(
                             candidate_blocks[
                                 candidate_id
                             ]
                         )
                     ),
-                    "block_score": candidate_scores[
+                    candidate_scores[
                         candidate_id
                     ],
-                }
+                )
             )
 
     # ------------------------------------------------------------------
@@ -805,15 +1096,11 @@ def generate_all_candidates(
     )
 
     if not candidates.empty:
-
-        candidates = candidates.sort_values(
-            [
-                "source1_entity_id",
-                "candidate_entity_id",
-            ]
-        ).reset_index(
-            drop=True
-        )
+        # Candidate rows are already generated deterministically per S1.
+        # Avoid a second global Pandas sort here because the combined
+        # candidate table can be close to one million rows and the sort
+        # creates a significant temporary memory allocation.
+        candidates = candidates.reset_index(drop=True)
 
     combined_stats = {
         "s2": s2_stats,
