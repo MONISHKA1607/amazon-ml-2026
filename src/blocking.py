@@ -1,161 +1,965 @@
 """
-blocking.py
-Multi-pass candidate generation using inverted indices (never a raw
-S1 x S2 x S3 nested loop — that is the #1 way teams die on runtime).
+Multi-pass candidate generation for business entity resolution.
 
-Each block type builds a token -> [entity_ids] index on the S2/S3 side
-once, then looks up each S1 entity's tokens against it. This is O(n) index
-construction + O(matches) lookup, not O(n*m).
+The blocker generates a manageable candidate set for every Source-1 entity
+using multiple blocking strategies:
 
-blocking recall = (# true pairs that appear in the candidate set) / (# all true pairs)
-This is the single most important diagnostic for this stage — a pair that
-never becomes a candidate can never be recovered later, however good the
-matching model is.
+    1. exact normalized name
+    2. name tokens
+    3. address tokens
+    4. character n-grams
+    5. numeric/address tokens
+    6. country + name prefix
+
+Common blocks are filtered using posting-list frequency limits to prevent
+candidate explosion.
+
+Every candidate also records:
+    - blocks_matched
+    - block_score
+
+These become useful diagnostics and later model features.
 """
+
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+from typing import Callable
 
 import pandas as pd
 
-from .normalize import char_ngrams, extract_numeric_tokens
+from .blocking_config import BlockingConfig
 
 
-def _build_inverted_index(df: pd.DataFrame, key_fn) -> dict:
-    """key_fn(row) -> iterable of keys. Returns key -> list[entity_id]."""
-    index = defaultdict(list)
-    for eid, keys in zip(df["entity_id"], df.apply(key_fn, axis=1)):
-        for k in keys:
-            if k:
-                index[k].append(eid)
-    return index
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def _safe_tokens(
+    value: str | None,
+    min_length: int = 4,
+) -> list[str]:
+    """Return sufficiently long whitespace-separated tokens."""
+
+    if not value:
+        return []
+
+    return [
+        token
+        for token in str(value).split()
+        if len(token) >= min_length
+    ]
 
 
-def _lookup_candidates(s1_df: pd.DataFrame, key_fn, index: dict) -> dict:
-    """Returns s1_entity_id -> set(candidate_ids) for a single block type."""
-    out = defaultdict(set)
-    for eid, keys in zip(s1_df["entity_id"], s1_df.apply(key_fn, axis=1)):
-        for k in keys:
-            if k in index:
-                out[eid].update(index[k])
-    return out
+def _char_ngrams_for_block(
+    value: str | None,
+    n: int,
+) -> list[str]:
+    """Return character n-grams from a normalized string."""
+
+    if not value:
+        return []
+
+    value = str(value)
+
+    if len(value) < n:
+        return []
+
+    return [
+        value[i : i + n]
+        for i in range(len(value) - n + 1)
+    ]
 
 
-def block_exact_name(s1_df, other_df):
-    idx = _build_inverted_index(other_df, lambda r: [r["norm_name"]] if r["norm_name"] else [])
-    return _lookup_candidates(s1_df, lambda r: [r["norm_name"]] if r["norm_name"] else [], idx)
-
-
-def block_name_tokens(s1_df, other_df, min_token_len=4):
-    """Any shared, sufficiently-long name token (skips short/common tokens)."""
-    def keys(row):
-        return {t for t in row["norm_name"].split(" ") if len(t) >= min_token_len}
-    idx = _build_inverted_index(other_df, keys)
-    return _lookup_candidates(s1_df, keys, idx)
-
-
-def block_address_tokens(s1_df, other_df, min_token_len=4):
-    def keys(row):
-        return {t for t in row["norm_address"].split(" ") if len(t) >= min_token_len}
-    idx = _build_inverted_index(other_df, keys)
-    return _lookup_candidates(s1_df, keys, idx)
-
-
-def block_char_ngrams(s1_df, other_df, n=3):
-    """Catches typos/transpositions that token blocks miss (e.g. 'Amazon Fresh' vs 'Amazon Frehs')."""
-    def keys(row):
-        return char_ngrams(row["norm_name"], n=n)
-    idx = _build_inverted_index(other_df, keys)
-    return _lookup_candidates(s1_df, keys, idx)
-
-
-def block_numeric_tokens(s1_df, other_df):
-    """Shared house number / PIN / postal code tokens in the address."""
-    def keys(row):
-        return extract_numeric_tokens(row["norm_address"])
-    idx = _build_inverted_index(other_df, keys)
-    return _lookup_candidates(s1_df, keys, idx)
-
-
-def block_country_name_prefix(s1_df, other_df, prefix_len=4):
-    """Country-scoped name-prefix block. Country is an open string set — never
-    hard-coded to {US, India}; France (or any other value) flows through untouched."""
-    def keys(row):
-        prefix = row["norm_name"][:prefix_len]
-        return [f"{row['country']}||{prefix}"] if prefix else []
-    idx = _build_inverted_index(other_df, keys)
-    return _lookup_candidates(s1_df, keys, idx)
-
-
-BLOCK_FUNCS = {
-    "exact_name": block_exact_name,
-    "name_tokens": block_name_tokens,
-    "address_tokens": block_address_tokens,
-    "char_ngrams": block_char_ngrams,
-    "numeric_tokens": block_numeric_tokens,
-    "country_name_prefix": block_country_name_prefix,
-}
-
-
-def generate_candidates(s1_df: pd.DataFrame, other_df: pd.DataFrame, block_names=None) -> pd.DataFrame:
+def _numeric_tokens_for_block(
+    value,
+) -> list[str]:
     """
-    Runs the requested blocks (default: all) against one other source
-    (Source 2 or Source 3) and returns the union as a long-format DataFrame:
-    source1_entity_id, candidate_entity_id, blocks_matched (comma list).
-    """
-    block_names = block_names or list(BLOCK_FUNCS.keys())
-    per_block = {}
-    for name in block_names:
-        per_block[name] = BLOCK_FUNCS[name](s1_df, other_df)
+    Normalize the representation of numeric_tokens.
 
-    union = defaultdict(lambda: defaultdict(set))  # s1_id -> cand_id -> {block names}
-    for name, mapping in per_block.items():
-        for s1_id, cand_ids in mapping.items():
-            for cid in cand_ids:
-                union[s1_id][cid].add(name)
+    The normalize module may store numeric tokens as a list/tuple/set
+    or as a whitespace-separated string.
+    """
+
+    if value is None:
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        return [
+            str(token)
+            for token in value
+            if str(token)
+        ]
+
+    return [
+        token
+        for token in str(value).split()
+        if token
+    ]
+
+
+def _country_name_prefix_for_block(
+    country: str | None,
+    name: str | None,
+    prefix_len: int = 4,
+) -> list[str]:
+    """
+    Create a country-scoped name-prefix blocking key.
+
+    Country is deliberately treated as an open string value. We do not
+    hard-code countries here so that unseen test countries such as France
+    work automatically.
+    """
+
+    if not country or not name:
+        return []
+
+    country = str(country).strip().lower()
+    name = str(name).strip()
+
+    if not country or not name:
+        return []
+
+    prefix = name[:prefix_len]
+
+    if len(prefix) < prefix_len:
+        return []
+
+    return [
+        f"{country}||{prefix}"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Inverted-index construction
+# ---------------------------------------------------------------------------
+
+def _build_inverted_index(
+    df: pd.DataFrame,
+    key_fn: Callable,
+    max_block_frequency: int = 5000,
+    max_candidates_per_block: int = 5000,
+) -> dict[str, list[str]]:
+    """
+    Build an inverted index.
+
+    Blocks whose posting lists are larger than max_block_frequency are
+    discarded completely.
+
+    This is important for common words/ngrams such as:
+        "the"
+        "restaurant"
+        "company"
+        "and"
+
+    which could otherwise generate enormous candidate sets.
+    """
+
+    postings: defaultdict[str, list[str]] = defaultdict(list)
+
+    for row in df.itertuples(index=False):
+        entity_id = row.entity_id
+
+        keys = key_fn(row)
+
+        if isinstance(keys, str):
+            keys = [keys]
+
+        # An entity contributes at most once to a given block.
+        for key in set(keys):
+            if not key:
+                continue
+
+            postings[key].append(entity_id)
+
+    filtered: dict[str, list[str]] = {}
+
+    for key, entity_ids in postings.items():
+
+        # Drop overly-common blocks.
+        if len(entity_ids) > max_block_frequency:
+            continue
+
+        # Remove accidental duplicates and make ordering deterministic.
+        entity_ids = sorted(set(entity_ids))
+
+        # Safety cap.
+        filtered[key] = entity_ids[
+            :max_candidates_per_block
+        ]
+
+    return filtered
+
+
+def _build_token_frequency(
+    df: pd.DataFrame,
+    column: str,
+    min_token_length: int = 4,
+) -> Counter:
+    """
+    Count the number of entities containing each token.
+
+    Each entity contributes at most once for a particular token.
+    """
+
+    counter = Counter()
+
+    for value in df[column].fillna(""):
+        tokens = set(
+            _safe_tokens(
+                value,
+                min_token_length,
+            )
+        )
+
+        counter.update(tokens)
+
+    return counter
+
+
+def _build_rare_token_index(
+    df: pd.DataFrame,
+    column: str,
+    token_frequency: Counter,
+    rare_token_frequency: int,
+    min_token_length: int = 4,
+) -> dict[str, list[str]]:
+    """
+    Build an index containing only relatively rare tokens.
+    """
+
+    postings: defaultdict[str, list[str]] = defaultdict(list)
+
+    for row in df.itertuples(index=False):
+
+        value = getattr(row, column, "")
+
+        tokens = set(
+            _safe_tokens(
+                value,
+                min_token_length,
+            )
+        )
+
+        for token in tokens:
+
+            if token_frequency[token] <= rare_token_frequency:
+                postings[token].append(
+                    row.entity_id
+                )
+
+    return {
+        token: sorted(set(entity_ids))
+        for token, entity_ids in postings.items()
+    }
+
+
+# ---------------------------------------------------------------------------
+# Candidate ranking
+# ---------------------------------------------------------------------------
+
+def _rank_candidates(
+    candidate_scores: dict[str, int],
+    max_candidates: int,
+) -> list[str]:
+    """
+    Rank candidates by blocking evidence.
+
+    More blocking agreements means a candidate is supported by more
+    independent blocking signals.
+
+    Candidate ID is used as a deterministic tie-breaker.
+    """
+
+    ranked = sorted(
+        candidate_scores.items(),
+        key=lambda item: (
+            -item[1],
+            item[0],
+        ),
+    )
+
+    return [
+        candidate_id
+        for candidate_id, _ in ranked[:max_candidates]
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Main candidate generation
+# ---------------------------------------------------------------------------
+
+def generate_candidates(
+    s1_df: pd.DataFrame,
+    other_df: pd.DataFrame,
+    block_names: list[str] | None = None,
+    config: BlockingConfig | None = None,
+    source_name: str | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Generate candidates between Source 1 and one candidate source.
+
+    Parameters
+    ----------
+    s1_df:
+        Normalized Source-1 dataframe.
+
+    other_df:
+        Normalized Source-2 or Source-3 dataframe.
+
+    block_names:
+        Blocking strategies to use.
+
+    config:
+        Blocking configuration.
+
+    source_name:
+        "S2" or "S3", used only for diagnostics.
+
+    Returns
+    -------
+    candidates:
+        DataFrame containing:
+
+            source1_entity_id
+            candidate_entity_id
+            blocks_matched
+            block_score
+
+    stats:
+        Candidate-generation diagnostics.
+    """
+
+    if config is None:
+        config = BlockingConfig()
+
+    if block_names is None:
+        block_names = config.enabled_blocks
+
+    if block_names is None:
+        block_names = [
+            "exact_name",
+            "name_tokens",
+            "address_tokens",
+            "char_ngrams",
+            "numeric_tokens",
+            "country_name_prefix",
+        ]
+
+    # ------------------------------------------------------------------
+    # Token frequencies
+    # ------------------------------------------------------------------
+
+    name_frequency = _build_token_frequency(
+        other_df,
+        "norm_name",
+        config.min_token_length,
+    )
+
+    address_frequency = _build_token_frequency(
+        other_df,
+        "norm_address",
+        config.min_token_length,
+    )
+
+    # ------------------------------------------------------------------
+    # Build indices
+    # ------------------------------------------------------------------
+
+    indices: dict[str, dict[str, list[str]]] = {}
+
+    if "exact_name" in block_names:
+
+        indices["exact_name"] = _build_inverted_index(
+            other_df,
+            lambda row: (
+                [row.norm_name]
+                if getattr(row, "norm_name", "")
+                else []
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "name_tokens" in block_names:
+
+        indices["name_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "norm_name", ""),
+                config.min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "address_tokens" in block_names:
+
+        indices["address_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "norm_address", ""),
+                config.min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "char_ngrams" in block_names:
+
+        indices["char_ngrams"] = _build_inverted_index(
+            other_df,
+            lambda row: _char_ngrams_for_block(
+                getattr(row, "norm_name", ""),
+                config.char_ngram_size,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "numeric_tokens" in block_names:
+
+        indices["numeric_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _numeric_tokens_for_block(
+                getattr(row, "numeric_tokens", ""),
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "country_name_prefix" in block_names:
+
+        indices["country_name_prefix"] = _build_inverted_index(
+            other_df,
+            lambda row: _country_name_prefix_for_block(
+                getattr(row, "country", ""),
+                getattr(row, "norm_name", ""),
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    # ------------------------------------------------------------------
+    # Rare-token indices
+    # ------------------------------------------------------------------
+
+    rare_name_index: dict[str, list[str]] = {}
+
+    if "name_tokens" in block_names:
+
+        rare_name_index = _build_rare_token_index(
+            other_df,
+            "norm_name",
+            name_frequency,
+            config.rare_token_frequency,
+            config.min_token_length,
+        )
+
+    rare_address_index: dict[str, list[str]] = {}
+
+    if "address_tokens" in block_names:
+
+        rare_address_index = _build_rare_token_index(
+            other_df,
+            "norm_address",
+            address_frequency,
+            config.rare_token_frequency,
+            config.min_token_length,
+        )
+
+    # ------------------------------------------------------------------
+    # Generate candidates
+    # ------------------------------------------------------------------
 
     rows = []
-    for s1_id, cands in union.items():
-        for cid, blocks in cands.items():
-            rows.append((s1_id, cid, ",".join(sorted(blocks))))
-    return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "blocks_matched"])
+
+    candidate_count_by_s1: dict[str, int] = {}
+
+    for s1_row in s1_df.itertuples(index=False):
+
+        s1_id = s1_row.entity_id
+
+        # candidate_id -> number of blocking agreements
+        candidate_scores: defaultdict[str, int] = defaultdict(int)
+
+        # candidate_id -> blocking strategies supporting it
+        candidate_blocks: defaultdict[str, set[str]] = defaultdict(set)
+
+        # --------------------------------------------------------------
+        # Standard blocking strategies
+        # --------------------------------------------------------------
+
+        for block_name in block_names:
+
+            index = indices.get(block_name)
+
+            if index is None:
+                continue
+
+            if block_name == "exact_name":
+
+                keys = [
+                    getattr(
+                        s1_row,
+                        "norm_name",
+                        "",
+                    )
+                ]
+
+            elif block_name == "name_tokens":
+
+                keys = _safe_tokens(
+                    getattr(
+                        s1_row,
+                        "norm_name",
+                        "",
+                    ),
+                    config.min_token_length,
+                )
+
+            elif block_name == "address_tokens":
+
+                keys = _safe_tokens(
+                    getattr(
+                        s1_row,
+                        "norm_address",
+                        "",
+                    ),
+                    config.min_token_length,
+                )
+
+            elif block_name == "char_ngrams":
+
+                keys = _char_ngrams_for_block(
+                    getattr(
+                        s1_row,
+                        "norm_name",
+                        "",
+                    ),
+                    config.char_ngram_size,
+                )
+
+            elif block_name == "numeric_tokens":
+
+                keys = _numeric_tokens_for_block(
+                    getattr(
+                        s1_row,
+                        "numeric_tokens",
+                        "",
+                    ),
+                )
+
+            elif block_name == "country_name_prefix":
+
+                keys = _country_name_prefix_for_block(
+                    getattr(
+                        s1_row,
+                        "country",
+                        "",
+                    ),
+                    getattr(
+                        s1_row,
+                        "norm_name",
+                        "",
+                    ),
+                )
+
+            else:
+                continue
+
+            for key in set(keys):
+
+                if not key:
+                    continue
+
+                candidate_ids = index.get(
+                    key,
+                    [],
+                )
+
+                for candidate_id in candidate_ids:
+
+                    candidate_scores[
+                        candidate_id
+                    ] += 1
+
+                    candidate_blocks[
+                        candidate_id
+                    ].add(
+                        block_name
+                    )
+
+        # --------------------------------------------------------------
+        # Rare name-token evidence
+        # --------------------------------------------------------------
+
+        if "name_tokens" in block_names:
+
+            name_tokens = _safe_tokens(
+                getattr(
+                    s1_row,
+                    "norm_name",
+                    "",
+                ),
+                config.min_token_length,
+            )
+
+            for token in name_tokens:
+
+                candidate_ids = rare_name_index.get(
+                    token,
+                    [],
+                )
+
+                for candidate_id in candidate_ids:
+
+                    candidate_scores[
+                        candidate_id
+                    ] += 1
+
+                    candidate_blocks[
+                        candidate_id
+                    ].add(
+                        "rare_name_token"
+                    )
+
+        # --------------------------------------------------------------
+        # Rare address-token evidence
+        # --------------------------------------------------------------
+
+        if "address_tokens" in block_names:
+
+            address_tokens = _safe_tokens(
+                getattr(
+                    s1_row,
+                    "norm_address",
+                    "",
+                ),
+                config.min_token_length,
+            )
+
+            for token in address_tokens:
+
+                candidate_ids = rare_address_index.get(
+                    token,
+                    [],
+                )
+
+                for candidate_id in candidate_ids:
+
+                    candidate_scores[
+                        candidate_id
+                    ] += 1
+
+                    candidate_blocks[
+                        candidate_id
+                    ].add(
+                        "rare_address_token"
+                    )
+
+        # --------------------------------------------------------------
+        # Candidate ranking and cap
+        # --------------------------------------------------------------
+
+        selected_ids = _rank_candidates(
+            candidate_scores,
+            config.max_candidates_per_entity,
+        )
+
+        candidate_count_by_s1[
+            s1_id
+        ] = len(selected_ids)
+
+        # --------------------------------------------------------------
+        # Save candidate rows
+        # --------------------------------------------------------------
+
+        for candidate_id in selected_ids:
+
+            rows.append(
+                {
+                    "source1_entity_id": s1_id,
+                    "candidate_entity_id": candidate_id,
+                    "blocks_matched": "|".join(
+                        sorted(
+                            candidate_blocks[
+                                candidate_id
+                            ]
+                        )
+                    ),
+                    "block_score": candidate_scores[
+                        candidate_id
+                    ],
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # Candidate dataframe
+    # ------------------------------------------------------------------
+
+    candidates = pd.DataFrame(
+        rows,
+        columns=[
+            "source1_entity_id",
+            "candidate_entity_id",
+            "blocks_matched",
+            "block_score",
+        ],
+    )
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    if candidate_count_by_s1:
+
+        counts = pd.Series(
+            candidate_count_by_s1,
+            dtype="int64",
+        )
+
+    else:
+
+        counts = pd.Series(
+            dtype="int64"
+        )
+
+    stats = {
+        "source": source_name,
+        "n_source1_entities": int(
+            len(s1_df)
+        ),
+        "n_candidate_pairs": int(
+            len(candidates)
+        ),
+        "n_s1_with_candidates": int(
+            (counts > 0).sum()
+        ),
+        "n_s1_without_candidates": int(
+            (counts == 0).sum()
+        ),
+        "mean_candidates_per_s1": float(
+            counts.mean()
+        ) if len(counts) else 0.0,
+        "median_candidates_per_s1": float(
+            counts.median()
+        ) if len(counts) else 0.0,
+        "p90_candidates_per_s1": float(
+            counts.quantile(0.90)
+        ) if len(counts) else 0.0,
+        "p95_candidates_per_s1": float(
+            counts.quantile(0.95)
+        ) if len(counts) else 0.0,
+        "p99_candidates_per_s1": float(
+            counts.quantile(0.99)
+        ) if len(counts) else 0.0,
+        "max_candidates_per_s1": int(
+            counts.max()
+        ) if len(counts) else 0,
+    }
+
+    return candidates, stats
 
 
-def generate_all_candidates(s1_df, s2_df, s3_df, block_names=None) -> pd.DataFrame:
-    cand2 = generate_candidates(s1_df, s2_df, block_names)
-    cand3 = generate_candidates(s1_df, s3_df, block_names)
-    return pd.concat([cand2, cand3], ignore_index=True)
+# ---------------------------------------------------------------------------
+# Generate S2 + S3 candidates
+# ---------------------------------------------------------------------------
 
-
-def compute_blocking_recall(candidates_df: pd.DataFrame, gt_dict: dict) -> dict:
+def generate_all_candidates(
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    block_names: list[str] | None = None,
+    config: BlockingConfig | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """
-    gt_dict: source1_entity_id -> set(true matched ids)
-    Returns overall recall plus per-S1 counts so you can see WHICH entities'
-    true matches are being missed by blocking (feed straight to error analysis).
+    Generate candidates against both Source 2 and Source 3.
     """
-    cand_map = defaultdict(set)
-    for s1, cid in zip(candidates_df["source1_entity_id"], candidates_df["candidate_entity_id"]):
-        cand_map[s1].add(cid)
+
+    if config is None:
+        config = BlockingConfig()
+
+    s2_candidates, s2_stats = generate_candidates(
+        s1_df=s1_df,
+        other_df=s2_df,
+        block_names=block_names,
+        config=config,
+        source_name="S2",
+    )
+
+    s3_candidates, s3_stats = generate_candidates(
+        s1_df=s1_df,
+        other_df=s3_df,
+        block_names=block_names,
+        config=config,
+        source_name="S3",
+    )
+
+    candidates = pd.concat(
+        [
+            s2_candidates,
+            s3_candidates,
+        ],
+        ignore_index=True,
+    )
+
+    if not candidates.empty:
+
+        candidates = candidates.sort_values(
+            [
+                "source1_entity_id",
+                "candidate_entity_id",
+            ]
+        ).reset_index(
+            drop=True
+        )
+
+    combined_stats = {
+        "s2": s2_stats,
+        "s3": s3_stats,
+        "n_s1_entities": int(
+            len(s1_df)
+        ),
+        "n_candidate_pairs": int(
+            len(candidates)
+        ),
+    }
+
+    return candidates, combined_stats
+
+
+# ---------------------------------------------------------------------------
+# Blocking recall
+# ---------------------------------------------------------------------------
+
+def compute_blocking_recall(
+    candidates_df: pd.DataFrame,
+    gt_dict: dict,
+) -> dict:
+    """
+    Compute blocking recall against ground truth.
+
+    Only entities with at least one true match contribute to pair recall.
+
+    Returns:
+        blocking_recall
+        total_true_pairs
+        total_found_pairs
+        n_entities_with_missed_matches
+        missed_examples
+        candidate_pair_count
+        avg_candidates_per_s1
+    """
+
+    candidate_map: defaultdict[str, set[str]] = defaultdict(set)
+
+    if not candidates_df.empty:
+
+        for s1_id, candidate_id in zip(
+            candidates_df[
+                "source1_entity_id"
+            ],
+            candidates_df[
+                "candidate_entity_id"
+            ],
+        ):
+
+            candidate_map[
+                s1_id
+            ].add(
+                candidate_id
+            )
 
     total_true = 0
     total_found = 0
+
     missed_entities = []
+
     for s1_id, true_ids in gt_dict.items():
+
         if not true_ids:
             continue
-        found = true_ids & cand_map.get(s1_id, set())
+
+        found = (
+            true_ids
+            & candidate_map.get(
+                s1_id,
+                set(),
+            )
+        )
+
         total_true += len(true_ids)
         total_found += len(found)
-        if found != true_ids:
-            missed_entities.append((s1_id, true_ids - found))
 
-    recall = total_found / total_true if total_true else 1.0
+        if found != true_ids:
+
+            missed_entities.append(
+                (
+                    s1_id,
+                    true_ids - found,
+                )
+            )
+
+    recall = (
+        total_found / total_true
+        if total_true
+        else 1.0
+    )
+
+    candidate_counts = (
+        candidates_df
+        .groupby(
+            "source1_entity_id"
+        )
+        .size()
+        if not candidates_df.empty
+        else pd.Series(
+            dtype="int64"
+        )
+    )
+
     return {
         "blocking_recall": recall,
         "total_true_pairs": total_true,
         "total_found_pairs": total_found,
-        "n_entities_with_missed_matches": len(missed_entities),
-        "missed_examples": missed_entities[:20],
-        "candidate_pair_count": len(candidates_df),
-        "avg_candidates_per_s1": candidates_df.groupby("source1_entity_id").size().mean() if len(candidates_df) else 0,
+        "n_entities_with_missed_matches": len(
+            missed_entities
+        ),
+        "missed_examples": missed_entities[
+            :20
+        ],
+        "candidate_pair_count": len(
+            candidates_df
+        ),
+        "avg_candidates_per_s1": (
+            float(
+                candidate_counts.mean()
+            )
+            if len(candidate_counts)
+            else 0.0
+        ),
+        "median_candidates_per_s1": (
+            float(
+                candidate_counts.median()
+            )
+            if len(candidate_counts)
+            else 0.0
+        ),
+        "p95_candidates_per_s1": (
+            float(
+                candidate_counts.quantile(
+                    0.95
+                )
+            )
+            if len(candidate_counts)
+            else 0.0
+        ),
+        "max_candidates_per_s1": (
+            int(
+                candidate_counts.max()
+            )
+            if len(candidate_counts)
+            else 0
+        ),
     }

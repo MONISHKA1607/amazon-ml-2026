@@ -1,0 +1,17 @@
+{
+    "version": "v1",
+    "enabled_blocks": [
+        "exact_name",
+        "name_tokens",
+        "address_tokens",
+        "char_ngrams",
+        "numeric_tokens",
+        "country_name_prefix"
+    ],
+    "min_token_length": 4,
+    "max_block_frequency": 5000,
+    "max_candidates_per_block": 5000,
+    "max_candidates_per_entity": 5000,
+    "char_ngram_size": 3,
+    "rare_token_frequency": 1000
+}

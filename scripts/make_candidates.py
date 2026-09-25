@@ -14,6 +14,14 @@ import json
 import os
 import sys
 
+import json
+
+from src.blocking_config import BlockingConfig
+from src.candidate_store import (
+    save_candidates,
+    save_metadata,
+)
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.data_loader import load_split, ground_truth_to_dict  # noqa: E402
 from src.normalize import add_normalized_columns  # noqa: E402
@@ -29,7 +37,22 @@ def main():
     ap.add_argument("--blocks", default=None, help="comma-separated block names, default = all")
     ap.add_argument("--out-dir", default="outputs/candidates")
     ap.add_argument("--owner", default="P1")
+    ap.add_argument(
+        "--config",
+        default="configs/blocking_v1.json",
+    )
     args = ap.parse_args()
+
+    with open(
+        args.config,
+        "r",
+        encoding="utf-8",
+    ) as f:
+        config_data = json.load(f)
+
+    config = BlockingConfig.from_dict(
+        config_data
+    )
 
     block_names = args.blocks.split(",") if args.blocks else None
 
@@ -39,7 +62,13 @@ def main():
     s3 = add_normalized_columns(ds.source3)
 
     with timer("blocking"):
-        candidates = generate_all_candidates(s1, s2, s3, block_names)
+        candidates, blocking_stats = generate_all_candidates(
+            s1_df=s1,
+            s2_df=s2,
+            s3_df=s3,
+            block_names=config.enabled_blocks,
+            config=config,
+        )
 
     out_path = os.path.join(args.out_dir, f"candidate_pairs_{args.version}.tsv")
     write_tsv(candidates, out_path)
@@ -64,3 +93,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+print()
+print("=== Candidate Generation Summary ===")
+print(f"Candidate version: {config.version}")
+print(f"Candidate file: {candidate_path}")
+print(f"Metadata file: {metadata_path}")
+
+print()
+print("S2:")
+for key, value in blocking_stats["s2"].items():
+    print(f"  {key}: {value}")
+
+print()
+print("S3:")
+for key, value in blocking_stats["s3"].items():
+    print(f"  {key}: {value}")
+
+print()
+print(
+    f"Total candidate pairs: "
+    f"{blocking_stats['n_candidate_pairs']}"
+)

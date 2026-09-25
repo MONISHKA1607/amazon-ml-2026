@@ -1,24 +1,55 @@
+# =========================
+# Python
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
 
+# Virtual environment
 .venv/
-.env
+venv/
+env/
 
-.ipynb_checkpoints/
-
-# Challenge data
+# =========================
+# Challenge dataset
+# =========================
 dataset/
 
+# =========================
 # Generated outputs
+# =========================
+output/
 outputs/
-models/
 
-# Experiment artifacts
-experiments/logs/*.json
-experiments/logs/*.log
+# Candidate files / generated artifacts
+candidates/
+artifacts/
 
-# OS/editor
-.DS_Store
+# =========================
+# Experiment / ML artifacts
+# =========================
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.bin
+*.parquet
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# IDE / OS
+# =========================
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+*.log
