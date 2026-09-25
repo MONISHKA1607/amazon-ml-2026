@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.venv/
+.env
+
+.ipynb_checkpoints/
+
+# Challenge data
+dataset/
+
+# Generated outputs
+outputs/
+models/
+
+# Experiment artifacts
+experiments/logs/*.json
+experiments/logs/*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
