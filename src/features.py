@@ -24,17 +24,54 @@ def _build_lookup(df: pd.DataFrame, cols):
     return {eid: {c: row[c] for c in cols} for eid, row in zip(df["entity_id"], df[cols].to_dict("records"))}
 
 
-def build_tfidf_matrix(*name_series, analyzer="char_wb", ngram_range=(2, 4)):
+def build_tfidf_vectorizer(
+    *fit_series,
+    analyzer="char_wb",
+    ngram_range=(2, 4),
+):
     """
-    Fit one shared TF-IDF vectorizer across all sources so vectors are
-    comparable, then transform each series. char_wb n-grams are robust to
-    typos/transliteration and work for non-Latin scripts without needing
-    word tokenization.
+    Fit one shared TF-IDF vectorizer on the supplied training-side text.
+
+    The caller can then use the returned vectorizer to transform any
+    train/validation/test series without refitting it.
     """
-    vectorizer = TfidfVectorizer(analyzer=analyzer, ngram_range=ngram_range, min_df=1)
-    all_text = pd.concat(name_series)
+    vectorizer = TfidfVectorizer(
+        analyzer=analyzer,
+        ngram_range=ngram_range,
+        min_df=1,
+    )
+
+    all_text = pd.concat(
+        fit_series,
+        ignore_index=True,
+    )
+
     vectorizer.fit(all_text)
-    return vectorizer, [vectorizer.transform(s) for s in name_series]
+
+    return vectorizer
+
+
+def build_tfidf_matrix(
+    *name_series,
+    analyzer="char_wb",
+    ngram_range=(2, 4),
+):
+    """
+    Fit one shared TF-IDF vectorizer across all supplied series and
+    transform each series.
+
+    Kept for compatibility with existing callers.
+    """
+    vectorizer = build_tfidf_vectorizer(
+        *name_series,
+        analyzer=analyzer,
+        ngram_range=ngram_range,
+    )
+
+    return vectorizer, [
+        vectorizer.transform(series)
+        for series in name_series
+    ]
 
 
 def compute_features(

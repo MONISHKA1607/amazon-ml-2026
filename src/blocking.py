@@ -353,6 +353,264 @@ def _rank_candidates(
         for candidate_id, _ in ranked[:max_candidates]
     ]
 
+def build_blocking_context(
+    other_df: pd.DataFrame,
+    block_names: list[str] | None = None,
+    config: BlockingConfig | None = None,
+) -> dict:
+    """
+    Build all blocking indices for one candidate source.
+
+    The returned context can be reused for many Source-1 batches.
+    This is the memory-safe/chunked counterpart of the index-building
+    portion of generate_candidates().
+
+    IMPORTANT:
+        This function intentionally uses the same index construction
+        logic and configuration as generate_candidates().
+    """
+
+    if config is None:
+        config = BlockingConfig()
+
+    if block_names is None:
+        block_names = config.enabled_blocks
+
+    if block_names is None:
+        block_names = [
+            "exact_name",
+            "name_tokens",
+            "short_name_tokens",
+            "address_tokens",
+            "char_ngrams",
+            "numeric_tokens",
+            "country_name_prefix",
+            "translit_exact_name",
+            "translit_name_tokens",
+            "translit_char_ngrams",
+            "translit_address_tokens",
+            "address_numeric_anchor",
+        ]
+
+    block_names = list(block_names)
+
+    # --------------------------------------------------------------
+    # Token frequencies
+    # --------------------------------------------------------------
+
+    name_frequency = _build_token_frequency(
+        other_df,
+        "norm_name",
+        config.min_token_length,
+    )
+
+    address_frequency = _build_token_frequency(
+        other_df,
+        "norm_address",
+        config.min_token_length,
+    )
+
+    # --------------------------------------------------------------
+    # Standard inverted indices
+    # --------------------------------------------------------------
+
+    indices: dict[str, dict[str, list[str]]] = {}
+
+    if "exact_name" in block_names:
+        indices["exact_name"] = _build_inverted_index(
+            other_df,
+            lambda row: (
+                [row.norm_name]
+                if getattr(row, "norm_name", "")
+                else []
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "name_tokens" in block_names:
+        indices["name_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "norm_name", ""),
+                config.min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "short_name_tokens" in block_names:
+        indices["short_name_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "norm_name", ""),
+                config.short_name_token_min_length,
+            ),
+            config.short_name_token_max_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "address_tokens" in block_names:
+        indices["address_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "norm_address", ""),
+                config.min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "char_ngrams" in block_names:
+        indices["char_ngrams"] = _build_inverted_index(
+            other_df,
+            lambda row: _char_ngrams_for_block(
+                getattr(row, "norm_name", ""),
+                config.char_ngram_size,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "numeric_tokens" in block_names:
+        indices["numeric_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _numeric_tokens_for_block(
+                getattr(row, "numeric_tokens", ""),
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "country_name_prefix" in block_names:
+        indices["country_name_prefix"] = _build_inverted_index(
+            other_df,
+            lambda row: _country_name_prefix_for_block(
+                getattr(row, "country", ""),
+                getattr(row, "norm_name", ""),
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    # --------------------------------------------------------------
+    # Transliteration indices
+    #
+    # IMPORTANT:
+    # These are deliberately NOT nested under country_name_prefix.
+    # --------------------------------------------------------------
+
+    if "translit_exact_name" in block_names:
+        indices["translit_exact_name"] = _build_inverted_index(
+            other_df,
+            lambda row: (
+                [row.translit_name]
+                if getattr(row, "translit_name", "")
+                else []
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "translit_name_tokens" in block_names:
+        indices["translit_name_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "translit_name", ""),
+                config.min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "translit_char_ngrams" in block_names:
+        indices["translit_char_ngrams"] = _build_inverted_index(
+            other_df,
+            lambda row: _char_ngrams_for_block(
+                getattr(row, "translit_name", ""),
+                config.char_ngram_size,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "translit_address_tokens" in block_names:
+        indices["translit_address_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "translit_address", ""),
+                config.min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "address_numeric_anchor" in block_names:
+        indices["address_numeric_anchor"] = _build_inverted_index(
+            other_df,
+            lambda row: _address_numeric_anchor_keys(
+                getattr(row, "norm_address", ""),
+                getattr(row, "numeric_tokens", ""),
+                config.address_anchor_min_token_length,
+            ),
+            config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    # --------------------------------------------------------------
+    # Rare-token indices
+    # --------------------------------------------------------------
+
+    rare_name_index: dict[str, list[str]] = {}
+
+    if "name_tokens" in block_names:
+        rare_name_index = _build_rare_token_index(
+            other_df,
+            "norm_name",
+            name_frequency,
+            config.rare_token_frequency,
+            config.min_token_length,
+        )
+
+    rare_address_index: dict[str, list[str]] = {}
+
+    if "address_tokens" in block_names:
+        rare_address_index = _build_rare_token_index(
+            other_df,
+            "norm_address",
+            address_frequency,
+            config.rare_token_frequency,
+            config.min_token_length,
+        )
+
+    translit_address_frequency = Counter()
+
+    if "translit_address_tokens" in block_names:
+        translit_address_frequency = _build_token_frequency(
+            other_df,
+            "translit_address",
+            config.min_token_length,
+        )
+
+    rare_translit_address_index: dict[str, list[str]] = {}
+
+    if "translit_address_tokens" in block_names:
+        rare_translit_address_index = _build_rare_token_index(
+            other_df,
+            "translit_address",
+            translit_address_frequency,
+            config.rare_token_frequency,
+            config.min_token_length,
+        )
+
+    return {
+        "block_names": block_names,
+        "indices": indices,
+        "rare_name_index": rare_name_index,
+        "rare_address_index": rare_address_index,
+        "rare_translit_address_index": rare_translit_address_index,
+    }
+
 # ---------------------------------------------------------------------------
 # Main candidate generation
 # ---------------------------------------------------------------------------
@@ -363,6 +621,7 @@ def generate_candidates(
     block_names: list[str] | None = None,
     config: BlockingConfig | None = None,
     source_name: str | None = None,
+    blocking_context: dict | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
     Generate candidates between Source 1 and one candidate source.
@@ -421,221 +680,23 @@ def generate_candidates(
         ]
 
     # ------------------------------------------------------------------
-    # Token frequencies
+    # Build or reuse blocking context
     # ------------------------------------------------------------------
 
-    name_frequency = _build_token_frequency(
-        other_df,
-        "norm_name",
-        config.min_token_length,
-    )
-
-    address_frequency = _build_token_frequency(
-        other_df,
-        "norm_address",
-        config.min_token_length,
-    )
-
-    # ------------------------------------------------------------------
-    # Build indices
-    # ------------------------------------------------------------------
-
-    indices: dict[str, dict[str, list[str]]] = {}
-
-    if "exact_name" in block_names:
-
-        indices["exact_name"] = _build_inverted_index(
-            other_df,
-            lambda row: (
-                [row.norm_name]
-                if getattr(row, "norm_name", "")
-                else []
-            ),
-            config.max_block_frequency,
-            config.max_candidates_per_block,
+    if blocking_context is None:
+        blocking_context = build_blocking_context(
+            other_df=other_df,
+            block_names=block_names,
+            config=config,
         )
 
-    if "name_tokens" in block_names:
-
-        indices["name_tokens"] = _build_inverted_index(
-            other_df,
-            lambda row: _safe_tokens(
-                getattr(row, "norm_name", ""),
-                config.min_token_length,
-            ),
-            config.max_block_frequency,
-            config.max_candidates_per_block,
-        )
-
-    if "short_name_tokens" in block_names:
-        indices["short_name_tokens"] = _build_inverted_index(
-            other_df,
-            lambda row: _safe_tokens(
-                getattr(row, "norm_name", ""),
-                config.short_name_token_min_length,
-            ),
-            config.short_name_token_max_frequency,
-            config.max_candidates_per_block,
-        )
-
-    if "address_tokens" in block_names:
-
-        indices["address_tokens"] = _build_inverted_index(
-            other_df,
-            lambda row: _safe_tokens(
-                getattr(row, "norm_address", ""),
-                config.min_token_length,
-            ),
-            config.max_block_frequency,
-            config.max_candidates_per_block,
-        )
-
-    if "char_ngrams" in block_names:
-
-        indices["char_ngrams"] = _build_inverted_index(
-            other_df,
-            lambda row: _char_ngrams_for_block(
-                getattr(row, "norm_name", ""),
-                config.char_ngram_size,
-            ),
-            config.max_block_frequency,
-            config.max_candidates_per_block,
-        )
-
-    if "numeric_tokens" in block_names:
-
-        indices["numeric_tokens"] = _build_inverted_index(
-            other_df,
-            lambda row: _numeric_tokens_for_block(
-                getattr(row, "numeric_tokens", ""),
-            ),
-            config.max_block_frequency,
-            config.max_candidates_per_block,
-        )
-
-    if "country_name_prefix" in block_names:
-
-        indices["country_name_prefix"] = _build_inverted_index(
-            other_df,
-            lambda row: _country_name_prefix_for_block(
-                getattr(row, "country", ""),
-                getattr(row, "norm_name", ""),
-            ),
-            config.max_block_frequency,
-            config.max_candidates_per_block,
-        )
-
-        if "translit_exact_name" in block_names:
-
-            indices["translit_exact_name"] = _build_inverted_index(
-                other_df,
-                lambda row: (
-                    [row.translit_name]
-                    if getattr(row, "translit_name", "")
-                    else []
-                ),
-                config.max_block_frequency,
-                config.max_candidates_per_block,
-            )
-
-        if "translit_name_tokens" in block_names:
-
-            indices["translit_name_tokens"] = _build_inverted_index(
-                other_df,
-                lambda row: _safe_tokens(
-                    getattr(row, "translit_name", ""),
-                    config.min_token_length,
-                ),
-                config.max_block_frequency,
-                config.max_candidates_per_block,
-            )
-
-        if "translit_char_ngrams" in block_names:
-
-            indices["translit_char_ngrams"] = _build_inverted_index(
-                other_df,
-                lambda row: _char_ngrams_for_block(
-                    getattr(row, "translit_name", ""),
-                    config.char_ngram_size,
-                ),
-                config.max_block_frequency,
-                config.max_candidates_per_block,
-            )
-
-        if "translit_address_tokens" in block_names:
-
-            indices["translit_address_tokens"] = _build_inverted_index(
-                other_df,
-                lambda row: _safe_tokens(
-                    getattr(row, "translit_address", ""),
-                    config.min_token_length,
-                ),
-                config.max_block_frequency,
-                config.max_candidates_per_block,
-            )
-
-        if "address_numeric_anchor" in block_names:
-
-            indices["address_numeric_anchor"] = _build_inverted_index(
-                other_df,
-                lambda row: _address_numeric_anchor_keys(
-                    getattr(row, "norm_address", ""),
-                    getattr(row, "numeric_tokens", ""),
-                    config.address_anchor_min_token_length,
-                ),
-                config.max_block_frequency,
-                config.max_candidates_per_block,
-            )
-
-    # ------------------------------------------------------------------
-    # Rare-token indices
-    # ------------------------------------------------------------------
-
-    rare_name_index: dict[str, list[str]] = {}
-
-    if "name_tokens" in block_names:
-
-        rare_name_index = _build_rare_token_index(
-            other_df,
-            "norm_name",
-            name_frequency,
-            config.rare_token_frequency,
-            config.min_token_length,
-        )
-
-    rare_address_index: dict[str, list[str]] = {}
-
-    if "address_tokens" in block_names:
-
-        rare_address_index = _build_rare_token_index(
-            other_df,
-            "norm_address",
-            address_frequency,
-            config.rare_token_frequency,
-            config.min_token_length,
-        )
-
-        translit_address_frequency = Counter()
-
-        if "translit_address_tokens" in block_names:
-
-            translit_address_frequency = _build_token_frequency(
-                other_df,
-                "translit_address",
-                config.min_token_length,
-            )
-
-        rare_translit_address_index: dict[str, list[str]] = {}
-
-        if "translit_address_tokens" in block_names:
-
-            rare_translit_address_index = _build_rare_token_index(
-                other_df,
-                "translit_address",
-                translit_address_frequency,
-                config.rare_token_frequency,
-                config.min_token_length,
-            )
+    block_names = blocking_context["block_names"]
+    indices = blocking_context["indices"]
+    rare_name_index = blocking_context["rare_name_index"]
+    rare_address_index = blocking_context["rare_address_index"]
+    rare_translit_address_index = blocking_context[
+        "rare_translit_address_index"
+    ]
 
     # ------------------------------------------------------------------
     # Generate candidates
@@ -1033,6 +1094,87 @@ def generate_candidates(
 
     return candidates, stats
 
+def generate_candidates_batch(
+    s1_batch_df: pd.DataFrame,
+    blocking_context: dict,
+    config: BlockingConfig | None = None,
+    source_name: str | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Generate candidates for one Source-1 batch using a pre-built
+    blocking context.
+
+    This avoids rebuilding the potentially large Source-2/Source-3
+    inverted indices for every Source-1 batch.
+    """
+
+    if config is None:
+        config = BlockingConfig()
+
+    return generate_candidates(
+        s1_df=s1_batch_df,
+        other_df=pd.DataFrame(),
+        block_names=blocking_context["block_names"],
+        config=config,
+        source_name=source_name,
+        blocking_context=blocking_context,
+    )
+
+def iter_candidate_batches(
+    s1_df: pd.DataFrame,
+    other_df: pd.DataFrame,
+    batch_size: int = 5000,
+    block_names: list[str] | None = None,
+    config: BlockingConfig | None = None,
+    source_name: str | None = None,
+):
+    """
+    Yield candidate DataFrames for consecutive Source-1 batches.
+
+    The blocking context for the candidate source is constructed exactly
+    once and reused for every batch.
+
+    This function deliberately yields rather than accumulating all
+    candidates
+    in memory.
+    """
+
+    if config is None:
+        config = BlockingConfig()
+
+    if block_names is None:
+        block_names = config.enabled_blocks
+
+    context = build_blocking_context(
+        other_df=other_df,
+        block_names=block_names,
+        config=config,
+    )
+
+    total_entities = len(s1_df)
+
+    for start in range(
+        0,
+        total_entities,
+        batch_size,
+    ):
+        end = min(
+            start + batch_size,
+            total_entities,
+        )
+
+        s1_batch = s1_df.iloc[
+            start:end
+        ].copy()
+
+        candidates, stats = generate_candidates_batch(
+            s1_batch_df=s1_batch,
+            blocking_context=context,
+            config=config,
+            source_name=source_name,
+        )
+
+        yield start, end, candidates, stats
 
 # ---------------------------------------------------------------------------
 # Generate S2 + S3 candidates

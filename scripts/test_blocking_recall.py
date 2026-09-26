@@ -12,7 +12,7 @@ from src.blocking_config import BlockingConfig
 
 
 SEED = 42
-N_S1_SAMPLE = 1000
+N_S1_SAMPLE = 5000
 N_NEGATIVE_S2 = 5000
 N_NEGATIVE_S3 = 5000
 
@@ -399,7 +399,7 @@ def main():
         diagnostic_config = BlockingConfig(
             max_block_frequency=500,
             max_candidates_per_block=500,
-            max_candidates_per_entity=5000,
+            max_candidates_per_entity=500,
         )
 
         diagnostic_candidates, diagnostic_stats = generate_all_candidates(
