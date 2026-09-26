@@ -1,172 +1,149 @@
-#!/usr/bin/env python3
+from __future__ import annotations
 
-import json
-import os
 import sys
+from pathlib import Path
 
-import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import pandas as pd
 
-sys.path.insert(
-    0,
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-    ),
-)
-
-from src.blocking_config import BlockingConfig
 from src.data_loader import load_split
-from src.normalize import add_normalized_columns
-from src.blocking import generate_candidates
 from src.features import (
+    build_tfidf_vectorizer,
     compute_features,
     compute_features_batch,
 )
+from src.normalize import add_normalized_columns
 
 
-def load_config():
-    with open(
-        "configs/blocking_v2.json",
-        "r",
-        encoding="utf-8",
-    ) as f:
-        data = json.load(f)
+def main() -> None:
+    SAMPLE_S1 = 1000
+    SAMPLE_S2 = 5000
+    SAMPLE_S3 = 5000
 
-    return BlockingConfig(
-        version=data["version"],
-        enabled_blocks=data["enabled_blocks"],
-        min_token_length=data["min_token_length"],
-        max_block_frequency=data["max_block_frequency"],
-        max_candidates_per_block=data[
-            "max_candidates_per_block"
-        ],
-        max_candidates_per_entity=data[
-            "max_candidates_per_entity"
-        ],
-        char_ngram_size=data[
-            "char_ngram_size"
-        ],
-        rare_token_frequency=data[
-            "rare_token_frequency"
-        ],
-        address_anchor_min_token_length=data[
-            "address_anchor_min_token_length"
-        ],
-        short_name_token_min_length=data[
-            "short_name_token_min_length"
-        ],
-        short_name_token_max_frequency=data[
-            "short_name_token_max_frequency"
-        ],
+    print("Loading data...")
+    dataset = load_split("dataset", "train")
+
+    s1 = dataset.source1.copy()
+    s2 = dataset.source2.copy()
+    s3 = dataset.source3.copy()
+    gt = dataset.ground_truth.copy()
+
+    s1 = s1.head(SAMPLE_S1).copy()
+    s2 = s2.head(SAMPLE_S2).copy()
+    s3 = s3.head(SAMPLE_S3).copy()
+
+    print("Normalizing...")
+    s1 = add_normalized_columns(s1)
+    s2 = add_normalized_columns(s2)
+    s3 = add_normalized_columns(s3)
+
+    # ------------------------------------------------------------
+    # Build a small candidate set using deterministic IDs.
+    # ------------------------------------------------------------
+    candidates_s2 = pd.DataFrame(
+        {
+            "source1_entity_id": s1["entity_id"].values,
+            "candidate_entity_id": s2["entity_id"].iloc[
+                : len(s1)
+            ].values,
+        }
     )
 
-
-def main():
-    config = load_config()
-
-    ds = load_split(
-        "dataset",
-        "train",
+    # Repeat candidates so we have enough rows for a meaningful test.
+    candidates_s2 = pd.concat(
+        [
+            candidates_s2,
+            pd.DataFrame(
+                {
+                    "source1_entity_id": s1["entity_id"].iloc[
+                        : len(s1)
+                    ].values,
+                    "candidate_entity_id": s2["entity_id"].iloc[
+                        len(s1) : 2 * len(s1)
+                    ].values,
+                }
+            ),
+        ],
+        ignore_index=True,
     )
 
-    s1 = add_normalized_columns(
-        ds.source1.head(100)
+    candidates_s2["blocks_matched"] = "test"
+    candidates_s2["block_score"] = 1
+
+    # ------------------------------------------------------------
+    # Fit small training-only TF-IDF vectorizers.
+    # ------------------------------------------------------------
+    name_vectorizer = build_tfidf_vectorizer(
+        pd.concat(
+            [
+                s1["norm_name"],
+                s2["norm_name"],
+            ],
+            ignore_index=True,
+        )
     )
 
-    s2 = add_normalized_columns(
-        ds.source2.head(5000)
+    address_vectorizer = build_tfidf_vectorizer(
+        pd.concat(
+            [
+                s1["norm_address"],
+                s2["norm_address"],
+            ],
+            ignore_index=True,
+        )
     )
 
-    candidates, _ = generate_candidates(
-        s1_df=s1,
-        other_df=s2,
-        block_names=config.enabled_blocks,
-        config=config,
-        source_name="S2",
-    )
-
-    # Keep the comparison manageable.
-    candidates = candidates.head(
-        5000
-    ).reset_index(drop=True)
-
-    old_features = compute_features(
-        candidates,
+    print("Computing original features...")
+    original = compute_features(
+        candidates_s2,
         s1,
         s2,
+        name_tfidf_vectorizer=name_vectorizer,
+        addr_tfidf_vectorizer=address_vectorizer,
     )
 
-    referenced_s1 = s1[
-        s1["entity_id"].isin(
-            candidates[
-                "source1_entity_id"
-            ]
-        )
-    ].copy()
-
-    referenced_s2 = s2[
-        s2["entity_id"].isin(
-            candidates[
-                "candidate_entity_id"
-            ]
-        )
-    ].copy()
-
-    new_features = compute_features_batch(
-        candidates,
-        referenced_s1,
-        referenced_s2,
+    print("Computing batch features...")
+    batch = compute_features_batch(
+        candidates_s2,
+        s1,
+        s2,
+        name_tfidf_vectorizer=name_vectorizer,
+        addr_tfidf_vectorizer=address_vectorizer,
     )
 
-    feature_columns = [
-        "name_ratio",
-        "name_partial_ratio",
-        "name_token_sort_ratio",
-        "name_token_set_ratio",
-        "addr_ratio",
-        "addr_token_sort_ratio",
-        "name_exact",
-        "addr_exact",
-        "country_match",
-        "name_len_diff",
-        "addr_len_diff",
-        "name_token_jaccard",
-        "addr_token_jaccard",
-        "numeric_overlap",
-    ]
+    original = original.sort_values(
+        ["source1_entity_id", "candidate_entity_id"]
+    ).reset_index(drop=True)
 
-    for column in feature_columns:
-        old_values = old_features[
-            column
-        ].to_numpy()
+    batch = batch.sort_values(
+        ["source1_entity_id", "candidate_entity_id"]
+    ).reset_index(drop=True)
 
-        new_values = new_features[
-            column
-        ].to_numpy()
+    if list(original.columns) != list(batch.columns):
+        print("FAIL: feature columns differ.")
+        print("Original:", list(original.columns))
+        print("Batch:", list(batch.columns))
+        raise SystemExit(1)
 
-        if not np.allclose(
-            old_values,
-            new_values,
-            equal_nan=True,
-        ):
-            print(
-                f"ERROR: mismatch in {column}"
-            )
-            raise SystemExit(1)
+    for column in original.columns:
+        a = original[column]
+        b = batch[column]
 
-    print(
-        f"Compared {len(candidates):,} candidate pairs."
-    )
+        if pd.api.types.is_numeric_dtype(a):
+            if not (
+                (a.fillna(0) - b.fillna(0)).abs() <= 1e-10
+            ).all():
+                print(f"FAIL: numeric column differs: {column}")
+                raise SystemExit(1)
+        else:
+            if not a.fillna("").equals(b.fillna("")):
+                print(f"FAIL: column differs: {column}")
+                raise SystemExit(1)
 
-    print(
-        "All non-TF-IDF feature columns match exactly."
-    )
-
-    print(
-        "\nPASS: batch feature computation "
-        "matches the existing implementation."
-    )
+    print(f"Compared {len(original):,} candidate pairs.")
+    print("All feature columns including TF-IDF match exactly.")
+    print("PASS: batch feature computation is fully equivalent.")
 
 
 if __name__ == "__main__":
