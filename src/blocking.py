@@ -335,55 +335,15 @@ def _rank_candidates(
     max_candidates: int,
 ) -> list[str]:
     """
-    Rank candidates using weighted blocking evidence.
+    Rank candidates by the number of blocking signals.
 
-    Strong structural/exact signals receive more weight than broad
-    fuzzy/token signals. Candidate ID is used as a deterministic
-    tie-breaker.
+    Candidate ID is used as a deterministic tie-breaker.
     """
 
-    block_weights = {
-        # Very strong structural/exact evidence
-        "exact_name": 8,
-        "address_numeric_anchor": 8,
-
-        # Strong rare evidence
-        "rare_name_token": 4,
-        "rare_address_token": 4,
-        "rare_translit_address_token": 4,
-
-        # Structured token evidence
-        "numeric_tokens": 3,
-        "country_name_prefix": 3,
-
-        # Ordinary token evidence
-        "name_tokens": 2,
-        "address_tokens": 2,
-        "translit_name_tokens": 2,
-        "translit_address_tokens": 2,
-
-        # Broad fuzzy evidence
-        "char_ngrams": 1,
-        "translit_char_ngrams": 1,
-    }
-
-    weighted_scores = {}
-
-    for candidate_id, raw_score in candidate_scores.items():
-        blocks = candidate_blocks.get(candidate_id, set())
-
-        weighted_score = sum(
-            block_weights.get(block, 1)
-            for block in blocks
-        )
-
-        weighted_scores[candidate_id] = weighted_score
-
     ranked = sorted(
-        weighted_scores.items(),
+        candidate_scores.items(),
         key=lambda item: (
             -item[1],
-            -candidate_scores[item[0]],
             item[0],
         ),
     )
@@ -448,6 +408,7 @@ def generate_candidates(
         block_names = [
             "exact_name",
             "name_tokens",
+            "short_name_tokens",
             "address_tokens",
             "char_ngrams",
             "numeric_tokens",
@@ -503,6 +464,17 @@ def generate_candidates(
                 config.min_token_length,
             ),
             config.max_block_frequency,
+            config.max_candidates_per_block,
+        )
+
+    if "short_name_tokens" in block_names:
+        indices["short_name_tokens"] = _build_inverted_index(
+            other_df,
+            lambda row: _safe_tokens(
+                getattr(row, "norm_name", ""),
+                config.short_name_token_min_length,
+            ),
+            config.short_name_token_max_frequency,
             config.max_candidates_per_block,
         )
 
@@ -705,7 +677,6 @@ def generate_candidates(
                 ]
 
             elif block_name == "name_tokens":
-
                 keys = _safe_tokens(
                     getattr(
                         s1_row,
@@ -713,6 +684,16 @@ def generate_candidates(
                         "",
                     ),
                     config.min_token_length,
+                )
+
+            elif block_name == "short_name_tokens":
+                keys = _safe_tokens(
+                    getattr(
+                        s1_row,
+                        "norm_name",
+                        "",
+                    ),
+                    config.short_name_token_min_length,
                 )
 
             elif block_name == "address_tokens":

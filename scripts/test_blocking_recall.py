@@ -317,6 +317,167 @@ def main():
     print("Candidate shape:")
     print(candidates.shape)
 
+    TARGET_S1 = "S1-312975533"
+    TARGET_CANDIDATE = "S3-688080907"
+
+    target_production_rows = candidates[
+        candidates["source1_entity_id"].eq(TARGET_S1)
+        & candidates["candidate_entity_id"].eq(TARGET_CANDIDATE)
+    ].copy()
+
+    print()
+    print("=" * 70)
+    print("PRODUCTION TARGET VERIFICATION")
+    print("=" * 70)
+
+    if target_production_rows.empty:
+        print("TARGET IS NOT IN PRODUCTION CANDIDATES")
+    else:
+        print("TARGET IS IN PRODUCTION CANDIDATES")
+        print(target_production_rows.to_string(index=False))
+
+        target_score = int(
+            target_production_rows.iloc[0]["block_score"]
+        )
+
+        s1_candidates = candidates[
+            candidates["source1_entity_id"].eq(TARGET_S1)
+        ]
+
+        higher_score = int(
+            (
+                s1_candidates["block_score"]
+                > target_score
+            ).sum()
+        )
+
+        same_score_lower_id = int(
+            (
+                (s1_candidates["block_score"] == target_score)
+                &
+                (
+                    s1_candidates["candidate_entity_id"]
+                    < TARGET_CANDIDATE
+                )
+            ).sum()
+        )
+
+        production_rank = (
+            higher_score
+            + same_score_lower_id
+            + 1
+        )
+
+        print()
+        print("Production candidate count:",
+            len(s1_candidates))
+        print("Target block score:",
+            target_score)
+        print("Production rank:",
+            production_rank)
+
+    # ---------------------------------------------------------------
+    # Diagnostic: inspect the actual production-pool rank of the
+    # remaining missed pair without changing the production cap.
+    # ---------------------------------------------------------------
+
+    TARGET_S1 = "S1-312975533"
+    TARGET_CANDIDATE = "S3-688080907"
+
+    print()
+    print("=" * 70)
+    print("DIAGNOSTIC: REMAINING BLOCKING MISS")
+    print("=" * 70)
+
+    target_s1 = s1[
+        s1["entity_id"].eq(TARGET_S1)
+    ].copy()
+
+    if target_s1.empty:
+        print(f"Target S1 not present: {TARGET_S1}")
+    else:
+        diagnostic_config = BlockingConfig(
+            max_block_frequency=500,
+            max_candidates_per_block=500,
+            max_candidates_per_entity=5000,
+        )
+
+        diagnostic_candidates, diagnostic_stats = generate_all_candidates(
+            s1_df=target_s1,
+            s2_df=s2,
+            s3_df=s3,
+            config=diagnostic_config,
+        )
+
+        target_rows = diagnostic_candidates[
+            diagnostic_candidates["candidate_entity_id"].eq(
+                TARGET_CANDIDATE
+            )
+        ].copy()
+
+        print(
+            f"Diagnostic candidate count: "
+            f"{len(diagnostic_candidates):,}"
+        )
+
+        if target_rows.empty:
+            print(
+                f"TARGET NOT GENERATED: "
+                f"{TARGET_S1} -> {TARGET_CANDIDATE}"
+            )
+        else:
+            target_score = int(
+                target_rows.iloc[0]["block_score"]
+            )
+
+            higher_score_count = int(
+                (
+                    diagnostic_candidates["block_score"]
+                    > target_score
+                ).sum()
+            )
+
+            same_score_lower_id_count = int(
+                (
+                    (
+                        diagnostic_candidates["block_score"]
+                        == target_score
+                    )
+                    &
+                    (
+                        diagnostic_candidates["candidate_entity_id"]
+                        < TARGET_CANDIDATE
+                    )
+                ).sum()
+            )
+
+            target_rank = (
+                higher_score_count
+                + same_score_lower_id_count
+                + 1
+            )
+
+            print("Target candidate:")
+            print(
+                target_rows.to_string(index=False)
+            )
+
+            print()
+            print(
+                f"Target raw block score: "
+                f"{target_score}"
+            )
+
+            print(
+                f"Target rank with max_candidates=5000: "
+                f"{target_rank}"
+            )
+
+            print(
+                f"Would survive production cap=500: "
+                f"{target_rank <= 500}"
+            )
+
     # ---------------------------------------------------------------
     # Restrict ground truth to sampled S1s.
     # ---------------------------------------------------------------

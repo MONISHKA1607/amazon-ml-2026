@@ -3,6 +3,7 @@
     "enabled_blocks": [
         "exact_name",
         "name_tokens",
+        "short_name_tokens",
         "address_tokens",
         "char_ngrams",
         "numeric_tokens",
@@ -19,5 +20,7 @@
     "max_candidates_per_entity": 5000,
     "char_ngram_size": 3,
     "rare_token_frequency": 1000,
-    "address_anchor_min_token_length": 4
+    "address_anchor_min_token_length": 4,
+    "short_name_token_min_length": 3,
+    "short_name_token_max_frequency": 10000
 }

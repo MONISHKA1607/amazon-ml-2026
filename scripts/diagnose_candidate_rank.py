@@ -12,7 +12,6 @@ from src.blocking_config import BlockingConfig
 
 MISSES = {
     "S1-312975533": "S3-688080907",
-    "S1-833436524": "S2-910790078",
 }
 
 
@@ -50,46 +49,20 @@ def inspect_target(
         print("\nNo candidates generated.")
         return
 
-    # Reconstruct the weighted ranking used by src.blocking._rank_candidates.
-    block_weights = {
-        "exact_name": 8,
-        "address_numeric_anchor": 8,
-        "rare_name_token": 4,
-        "rare_address_token": 4,
-        "rare_translit_address_token": 4,
-        "numeric_tokens": 3,
-        "country_name_prefix": 3,
-        "name_tokens": 2,
-        "address_tokens": 2,
-        "translit_name_tokens": 2,
-        "translit_address_tokens": 2,
-        "char_ngrams": 1,
-        "translit_char_ngrams": 1,
-    }
-
-
-    def weighted_score(blocks_matched):
-        blocks = set(blocks_matched.split("|"))
-        return sum(
-            block_weights.get(block, 1)
-            for block in blocks
-        )
-
-
-    candidates["weighted_score"] = candidates["blocks_matched"].apply(
-        weighted_score
-    )
+    # Reconstruct the exact ranking used by src.blocking._rank_candidates.
+    #
+    # Production ranking:
+    #   1. Higher block_score first.
+    #   2. Candidate ID ascending as deterministic tie-breaker.
 
     candidates = candidates.sort_values(
         by=[
             "source1_entity_id",
-            "weighted_score",
             "block_score",
             "candidate_entity_id",
         ],
         ascending=[
             True,
-            False,
             False,
             True,
         ],
@@ -113,7 +86,6 @@ def inspect_target(
                     "candidate_entity_id",
                     "blocks_matched",
                     "block_score",
-                    "weighted_score",
                     "rank",
                 ]
             ].to_string(index=False)
@@ -136,48 +108,15 @@ def main():
         ds.source1["entity_id"].isin(s1_ids)
     ].copy()
 
-    target_s2_id = MISSES["S1-833436524"]
-    target_s3_id = MISSES["S1-312975533"]
-
-    s2_target = ds.source2[
-        ds.source2["entity_id"].eq(target_s2_id)
-    ].copy()
-
-    s3_target = ds.source3[
-        ds.source3["entity_id"].eq(target_s3_id)
-    ].copy()
-
     print("Loading benchmark negatives...")
 
     NEGATIVE_N = 5000
 
-    s2_neg = ds.source2[
-        ~ds.source2["entity_id"].eq(target_s2_id)
-    ].head(NEGATIVE_N)
-
-    s3_neg = ds.source3[
-        ~ds.source3["entity_id"].eq(target_s3_id)
-    ].head(NEGATIVE_N)
-
-    s2 = pd.concat(
-        [s2_target, s2_neg],
-        ignore_index=True,
-    )
-
-    s3 = pd.concat(
-        [s3_target, s3_neg],
-        ignore_index=True,
-    )
-
     print(f"S1 records: {len(s1)}")
-    print(f"S2 records: {len(s2)}")
-    print(f"S3 records: {len(s3)}")
 
     print("\nNormalizing...")
 
     s1 = add_normalized_columns(s1)
-    s2 = add_normalized_columns(s2)
-    s3 = add_normalized_columns(s3)
 
     config = BlockingConfig(
         max_block_frequency=500,
@@ -189,16 +128,45 @@ def main():
     print(config.to_dict())
 
     for _, s1_row in s1.iterrows():
-        target_id = MISSES[s1_row["entity_id"]]
+        s1_id = s1_row["entity_id"]
+        target_id = MISSES[s1_id]
+
+        print("\n" + "#" * 100)
+        print(f"DIAGNOSTIC: {s1_id} -> {target_id}")
+        print("#" * 100)
+
+        if target_id.startswith("S2-"):
+            target_df = ds.source2
+            target_source = "S2"
+        else:
+            target_df = ds.source3
+            target_source = "S3"
+
+        target_row = target_df[
+            target_df["entity_id"].eq(target_id)
+        ].copy()
+
+        negatives = target_df[
+            ~target_df["entity_id"].eq(target_id)
+        ].head(NEGATIVE_N)
+
+        other_df = pd.concat(
+            [target_row, negatives],
+            ignore_index=True,
+        )
+
+        other_df = add_normalized_columns(other_df)
+
+        print(f"Target source: {target_source}")
+        print(f"Other records: {len(other_df)}")
 
         inspect_target(
             s1_row=s1_row,
             target_id=target_id,
-            s2=s2,
-            s3=s3,
+            s2=other_df if target_source == "S2" else pd.DataFrame(),
+            s3=other_df if target_source == "S3" else pd.DataFrame(),
             config=config,
         )
-
 
 if __name__ == "__main__":
     main()

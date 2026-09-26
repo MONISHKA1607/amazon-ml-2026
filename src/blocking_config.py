@@ -24,12 +24,16 @@ class BlockingConfig:
 
     address_anchor_min_token_length: int = 4
 
+    short_name_token_min_length: int = 3
+
+    short_name_token_max_frequency: int = 10000
+
     def to_dict(self) -> dict:
         return asdict(self)
 
-    @classmethod
-    def from_dict(
-        cls,
-        data: dict,
-    ) -> "BlockingConfig":
-        return cls(**data)
+        @classmethod
+        def from_dict(
+            cls,
+            data: dict,
+        ) -> "BlockingConfig":
+            return cls(**data)
