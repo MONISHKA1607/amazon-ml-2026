@@ -148,6 +148,350 @@ def compute_features(
 
     return pd.concat([candidates_df.reset_index(drop=True), feats.reset_index(drop=True)], axis=1)
 
+def compute_features_batch(
+    candidates_df: pd.DataFrame,
+    s1_df: pd.DataFrame,
+    other_df: pd.DataFrame,
+    name_tfidf_vectorizer=None,
+    addr_tfidf_vectorizer=None,
+) -> pd.DataFrame:
+    """
+    Compute pairwise features for a candidate batch.
+
+    Unlike compute_features(), this function expects s1_df and other_df
+    to contain only the entity rows referenced by candidates_df.
+
+    This keeps memory usage bounded during chunked training/inference.
+
+    Feature definitions intentionally match compute_features().
+    """
+
+    if candidates_df.empty:
+        return candidates_df.copy()
+
+    cols = [
+        "entity_id",
+        "norm_name",
+        "norm_address",
+        "country",
+        "numeric_tokens",
+    ]
+
+    s1_lookup = (
+        s1_df[
+            cols
+        ]
+        .drop_duplicates("entity_id")
+        .set_index("entity_id")
+    )
+
+    other_lookup = (
+        other_df[
+            cols
+        ]
+        .drop_duplicates("entity_id")
+        .set_index("entity_id")
+    )
+
+    s1_ids = candidates_df[
+        "source1_entity_id"
+    ].tolist()
+
+    candidate_ids = candidates_df[
+        "candidate_entity_id"
+    ].tolist()
+
+    # Reindex preserves candidate-row order.
+    s1_rows = s1_lookup.reindex(s1_ids)
+    other_rows = other_lookup.reindex(candidate_ids)
+
+    if s1_rows.isna().all(axis=1).any():
+        raise ValueError(
+            "Candidate batch contains Source-1 IDs that are missing "
+            "from s1_df."
+        )
+
+    if other_rows.isna().all(axis=1).any():
+        raise ValueError(
+            "Candidate batch contains candidate IDs that are missing "
+            "from other_df."
+        )
+
+    s1_names = (
+        s1_rows["norm_name"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    cand_names = (
+        other_rows["norm_name"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    s1_addrs = (
+        s1_rows["norm_address"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    cand_addrs = (
+        other_rows["norm_address"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    s1_countries = (
+        s1_rows["country"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    cand_countries = (
+        other_rows["country"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    s1_nums = (
+        s1_rows["numeric_tokens"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    cand_nums = (
+        other_rows["numeric_tokens"]
+        .fillna("")
+        .astype(str)
+        .tolist()
+    )
+
+    feats = pd.DataFrame(
+        index=range(
+            len(candidates_df)
+        )
+    )
+
+    # --------------------------------------------------------------
+    # RapidFuzz similarities
+    # --------------------------------------------------------------
+
+    feats["name_ratio"] = [
+        fuzz.ratio(a, b) / 100.0
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["name_partial_ratio"] = [
+        fuzz.partial_ratio(a, b) / 100.0
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["name_token_sort_ratio"] = [
+        fuzz.token_sort_ratio(a, b) / 100.0
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["name_token_set_ratio"] = [
+        fuzz.token_set_ratio(a, b) / 100.0
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["addr_ratio"] = [
+        fuzz.ratio(a, b) / 100.0
+        for a, b in zip(
+            s1_addrs,
+            cand_addrs,
+        )
+    ]
+
+    feats["addr_token_sort_ratio"] = [
+        fuzz.token_sort_ratio(a, b) / 100.0
+        for a, b in zip(
+            s1_addrs,
+            cand_addrs,
+        )
+    ]
+
+    # --------------------------------------------------------------
+    # Exact / structural
+    # --------------------------------------------------------------
+
+    feats["name_exact"] = [
+        int(
+            a == b and a != ""
+        )
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["addr_exact"] = [
+        int(
+            a == b and a != ""
+        )
+        for a, b in zip(
+            s1_addrs,
+            cand_addrs,
+        )
+    ]
+
+    feats["country_match"] = [
+        int(a == b)
+        for a, b in zip(
+            s1_countries,
+            cand_countries,
+        )
+    ]
+
+    feats["name_len_diff"] = [
+        abs(
+            len(a) - len(b)
+        )
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["addr_len_diff"] = [
+        abs(
+            len(a) - len(b)
+        )
+        for a, b in zip(
+            s1_addrs,
+            cand_addrs,
+        )
+    ]
+
+    # --------------------------------------------------------------
+    # Token Jaccard
+    # --------------------------------------------------------------
+
+    def token_jaccard(a, b):
+        ta = set(a.split())
+        tb = set(b.split())
+
+        if not ta and not tb:
+            return 0.0
+
+        return len(
+            ta & tb
+        ) / max(
+            1,
+            len(ta | tb),
+        )
+
+    feats["name_token_jaccard"] = [
+        token_jaccard(a, b)
+        for a, b in zip(
+            s1_names,
+            cand_names,
+        )
+    ]
+
+    feats["addr_token_jaccard"] = [
+        token_jaccard(a, b)
+        for a, b in zip(
+            s1_addrs,
+            cand_addrs,
+        )
+    ]
+
+    # --------------------------------------------------------------
+    # Numeric overlap
+    # --------------------------------------------------------------
+
+    def numeric_overlap(a, b):
+        sa = set(a.split(",")) - {""}
+        sb = set(b.split(",")) - {""}
+
+        if not sa or not sb:
+            return 0.0
+
+        return len(
+            sa & sb
+        ) / max(
+            1,
+            len(sa | sb),
+        )
+
+    feats["numeric_overlap"] = [
+        numeric_overlap(a, b)
+        for a, b in zip(
+            s1_nums,
+            cand_nums,
+        )
+    ]
+
+    # --------------------------------------------------------------
+    # TF-IDF
+    # --------------------------------------------------------------
+
+    if name_tfidf_vectorizer is not None:
+        v1 = name_tfidf_vectorizer.transform(
+            s1_names
+        )
+
+        v2 = name_tfidf_vectorizer.transform(
+            cand_names
+        )
+
+        feats["name_tfidf_cosine"] = (
+            np.asarray(
+                v1.multiply(v2).sum(
+                    axis=1
+                )
+            ).ravel()
+        )
+
+    if addr_tfidf_vectorizer is not None:
+        v1 = addr_tfidf_vectorizer.transform(
+            s1_addrs
+        )
+
+        v2 = addr_tfidf_vectorizer.transform(
+            cand_addrs
+        )
+
+        feats["addr_tfidf_cosine"] = (
+            np.asarray(
+                v1.multiply(v2).sum(
+                    axis=1
+                )
+            ).ravel()
+        )
+
+    return pd.concat(
+        [
+            candidates_df.reset_index(
+                drop=True
+            ),
+            feats.reset_index(
+                drop=True
+            ),
+        ],
+        axis=1,
+    )
 
 FEATURE_COLUMNS = [
     "name_ratio", "name_partial_ratio", "name_token_sort_ratio", "name_token_set_ratio",
